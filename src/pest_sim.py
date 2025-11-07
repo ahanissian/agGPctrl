@@ -29,12 +29,12 @@ class SimulationConfig:
     grid_size: tuple
     dt: float = 12.0
     duration: int = 50*24
-    mean_latency_period: float = 5*24
-    mean_transmission_period: float = 2*24
-    mean_recovery_period: float = 7*24
+    mean_latency_period: float = 7*24.0
+    mean_transmission_period: float = 2.5*24.0
+    mean_recovery_period: float = 5*24.0
     daily_max_damage: float = 0.1
-    initial_infected: int = 3
-    rng: np.random.Generator = np.random.default_rng()
+    initial_infected: int = 5
+    rng: np.random.Generator = np.random.default_rng(1)
 
 
 
@@ -64,18 +64,37 @@ class PestSimulation:
         """
         self.config = config
 
+        self.simulation_steps = int(self.config.duration // self.config.dt)
         self.field_state = np.full(self.config.grid_size, SUSCEPTIBLE)
         self.damage = np.ones(self.config.grid_size)
         self.history = []
 
         # Initialize the grid with some infected cells
-        latent_positions = np.random.choice(self.config.grid_size[0] * self.config.grid_size[1],
+        self.latent_positions = np.random.choice(self.config.grid_size[0] * self.config.grid_size[1],
                                             self.config.initial_infected, replace=False)
+        for pos in self.latent_positions:
+            self.field_state[pos // self.config.grid_size[1],
+                             pos % self.config.grid_size[1]] = LATENT
+    
+    def reset(self,keep_initial_positions = True):
+        """
+        Reset the simulation to its initial state.
+        """
+        self.field_state = np.full(self.config.grid_size, SUSCEPTIBLE)
+        self.damage = np.ones(self.config.grid_size)
+        self.history = []
+    
+        # Initialize the grid with some infected cells
+        if keep_initial_positions:
+            latent_positions = self.latent_positions
+        else:
+            latent_positions = np.random.choice(self.config.grid_size[0] * self.config.grid_size[1],
+                                                self.config.initial_infected, replace=False)
         for pos in latent_positions:
             self.field_state[pos // self.config.grid_size[1],
                              pos % self.config.grid_size[1]] = LATENT
 
-    def update_field(self,field_state):
+    def _update_field(self,field_state):
         """Rolls out simulation by one timestep.
 
         Args:
@@ -86,8 +105,6 @@ class PestSimulation:
         """
         dt = self.config.dt
         grid_size = self.config.grid_size
-        
-        # E[tsteps to recovery] = 1/p_geometric --> p_geometric = 1/E[tsteps to recovery]
         p_infection_geom = dt/self.config.mean_latency_period  # (mean timesteps until infection)^{-1}
         new_field = field_state.copy()
 
@@ -97,7 +114,7 @@ class PestSimulation:
 
                 if cell_state == INFECTED:
                     self._process_infected_cell(i,j, new_field)
-                elif cell_state == LATENT and self.config.rng.geometric(p_infection_geom):
+                elif cell_state == LATENT and self.config.rng.geometric(p_infection_geom) == 1:
                     new_field[i,j] = INFECTED
         return new_field
     
@@ -112,10 +129,11 @@ class PestSimulation:
         self.damage[i, j] -= np.random.rand() * damage_scale
 
         p_recovery_geom = dt/self.config.mean_recovery_period
+        rng = self.config.rng
 
         # If the cell is still alive
         if self.damage[i, j] > 0:
-            if self.config.rng.geometric(p_recovery_geom):  # Recovery condition
+            if rng.geometric(p_recovery_geom) == 1:  # Recovery condition
                 new_field[i, j] = RECOVERED
             else:
                 self._spread_infection(i, j, new_field)
@@ -130,11 +148,11 @@ class PestSimulation:
         rng = self.config.rng
         grid_size = self.config.grid_size
         # (mean tsteps until transmission)^{-1}
-        p_transmission_geom = self.config.dt/self.config.mean_transmission_period  
+        p_transmission_geom = self.config.dt/self.config.mean_transmission_period 
         for di, dj in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
             ni, nj = i + di, j + dj
             if 0 <= ni < grid_size[0] and 0 <= nj < grid_size[1]:
-                if self.field_state[ni, nj] == SUSCEPTIBLE and rng.geometric(p_transmission_geom):
+                if self.field_state[ni, nj] == SUSCEPTIBLE and rng.geometric(p_transmission_geom)==1:
                     new_field[ni, nj] = LATENT
 
     def run_simulation(self):
@@ -143,7 +161,7 @@ class PestSimulation:
         """
         self.history = [self.field_state.copy()]
         for _ in range(self.simulation_steps):
-            self.field_state = self.update_field(self.field_state)
+            self.field_state = self._update_field(self.field_state)
             self.history.append(self.field_state.copy())
 
     def plot_rollouts(self, time_points):
@@ -151,7 +169,6 @@ class PestSimulation:
         Plot the simulation rollouts at specified time points.
         """
         # Plot heatmap of infection density at various times
-        time_points = [0, self.simulation_steps // 3, 2 * self.simulation_steps // 3, self.simulation_steps]
         fig, axes = plt.subplots(1, len(time_points), sharey=True, figsize=(20, 5))
 
 
@@ -166,7 +183,7 @@ class PestSimulation:
 
         # Create a copy of history with category strings
         history_with_categories = [
-            np.vectorize(state_to_category.get)(state_grid) for state_grid in history
+            np.vectorize(state_to_category.get)(state_grid) for state_grid in self.history
         ]
 
         magma_colors = sns.color_palette("magma",5)  # Extract 5 distinct colors for the states
