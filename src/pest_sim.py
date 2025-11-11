@@ -1,4 +1,4 @@
-# TODO: decouple ABM sim code w/ pure functions
+# TODO: switch to xarrays
 
 
 from dataclasses import dataclass
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import numpy as np
 import seaborn as sns
 import catheat as ch
+import math
 
 import matplotlib.pyplot as plt
 
@@ -24,14 +25,23 @@ class SimulationConfig:
 
     Attributes:
         grid_size: tuple indicating dimension of grid representing the crop field.
-        infection_rate: float that represents the probability of infection 
+        dt: hours per timestep
+        ctrl_period: control action period (hours)
+        duration: length of simulation rollout (hours)
+        mean_latency_period: expected time a crop harbors disease but cannot spread it (hours)
+        mean_transmission_period: expected time for an infected crop to transmit to neighbor (hours)
+        mean_recovery_period: expected time to recover from infection (hours)
+        daily_max_damage: Maximum % of damage experienced by crop while infected. In range [0,1].
+        initial_infected: Number of crops latent with disease at start of simulation
+        rng: Probability generator, if a fixed seed is desired.
     """
     grid_size: tuple
-    dt: float = 12.0
+    dt: float = 4.0
+    ctrl_period = 8.0
     duration: int = 50*24
-    mean_latency_period: float = 7*24.0
+    mean_latency_period: float = 4*24.0
     mean_transmission_period: float = 2.5*24.0
-    mean_recovery_period: float = 5*24.0
+    mean_recovery_period: float = 14*24.0
     daily_max_damage: float = 0.1
     initial_infected: int = 5
     rng: np.random.Generator = np.random.default_rng(1)
@@ -43,7 +53,7 @@ class PestSimulation:
 
     This is a simplified agent based model representing the dispersion of blight throughout a crop
     initialization, a few crops are seeded with blight at uniformly sampled locations and enter
-    field. The field is represented as a 2D grid with points representing individual crops. Upon
+    field. The field is represented as a 2D grid with cells representing individual crops. Upon
     the LATENT state of infection, which is not detectable through observation. All other crops
     are initialized as SUSCEPTIBLE. A crop in the LATENT state has a chance to become INFECTED
     at every timestep, with the probability of becoming INFECTED being drawn from geometric
@@ -55,26 +65,31 @@ class PestSimulation:
     until it falls below 0, at which point the plant is DECEASED.
 
     Attributes:
-        likes_spam: A boolean indicating if we like SPAM or not.
-        eggs: An integer count of the eggs we have laid.
+        config: SimulationConfig object containing parameters of simulation.
+        n_steps: Number of timesteps in simulation rollout
+        field_state: 2D array storing disease state of each cell e.g. 1 = Infected, 2 = Latent, etc.
+        damage: 2D array storing damage state of each cell
+        history: list containing accumulated field states over time.
+        init_latent_cells: cells that are seeded with disesease at t=0
     """
     def __init__(self, config: SimulationConfig):
         """
         Initialize the simulation parameters and grid state.
         """
         self.config = config
-
-        self.simulation_steps = int(self.config.duration // self.config.dt)
-        self.field_state = np.full(self.config.grid_size, SUSCEPTIBLE)
+        grid_size = self.config.grid_size
+        self.n_steps = int(self.config.duration // self.config.dt)
+        self.ctrl_interval = math.ceil(self.config.ctrl_period/self.config.dt)
+        self.field_state = np.full(grid_size, SUSCEPTIBLE)
         self.damage = np.ones(self.config.grid_size)
         self.history = []
 
         # Initialize the grid with some infected cells
-        self.latent_positions = np.random.choice(self.config.grid_size[0] * self.config.grid_size[1],
+        self.init_latent_cells = np.random.choice(grid_size[0] * grid_size[1],
                                             self.config.initial_infected, replace=False)
-        for pos in self.latent_positions:
-            self.field_state[pos // self.config.grid_size[1],
-                             pos % self.config.grid_size[1]] = LATENT
+        for pos in self.init_latent_cells:
+            self.field_state[pos // grid_size[1],
+                             pos % grid_size[1]] = LATENT
     
     def reset(self,keep_initial_positions = True):
         """
@@ -86,15 +101,15 @@ class PestSimulation:
     
         # Initialize the grid with some infected cells
         if keep_initial_positions:
-            latent_positions = self.latent_positions
+            init_latent_cells = self.init_latent_cells
         else:
-            latent_positions = np.random.choice(self.config.grid_size[0] * self.config.grid_size[1],
+            init_latent_cells = np.random.choice(self.config.grid_size[0] * self.config.grid_size[1],
                                                 self.config.initial_infected, replace=False)
-        for pos in latent_positions:
+        for pos in init_latent_cells:
             self.field_state[pos // self.config.grid_size[1],
                              pos % self.config.grid_size[1]] = LATENT
 
-    def _update_field(self,field_state):
+    def _update_field(self,field_state, action=[(-1,-1)]):
         """Rolls out simulation by one timestep.
 
         Args:
@@ -105,20 +120,27 @@ class PestSimulation:
         """
         dt = self.config.dt
         grid_size = self.config.grid_size
-        p_infection_geom = dt/self.config.mean_latency_period  # (mean timesteps until infection)^{-1}
+        p_infection_geom = dt/self.config.mean_latency_period  # (mean tsteps until infection)^{-1}
         new_field = field_state.copy()
 
         for i in range(grid_size[0]):
             for j in range(grid_size[1]):
                 cell_state = field_state[i,j]
 
+                apply_treatment = False
+                if (i,j) in action:
+                    apply_treatment = True
+
                 if cell_state == INFECTED:
-                    self._process_infected_cell(i,j, new_field)
-                elif cell_state == LATENT and self.config.rng.geometric(p_infection_geom) == 1:
-                    new_field[i,j] = INFECTED
+                    self._process_infected_cell(i,j, new_field, apply_treatment)
+                elif cell_state == LATENT:
+                    if apply_treatment:
+                        new_field[i,j] = RECOVERED
+                    elif self.config.rng.geometric(p_infection_geom) == 1:
+                        new_field[i,j] = INFECTED
         return new_field
     
-    def _process_infected_cell(self, i, j, new_field):
+    def _process_infected_cell(self, i, j, new_field, apply_treatment):
         """
         Process an INFECTED cell and update its state in the new field.
         """
@@ -133,7 +155,9 @@ class PestSimulation:
 
         # If the cell is still alive
         if self.damage[i, j] > 0:
-            if rng.geometric(p_recovery_geom) == 1:  # Recovery condition
+            if apply_treatment:
+                new_field[i, j] = RECOVERED
+            elif rng.geometric(p_recovery_geom) == 1:  # Recovery condition
                 new_field[i, j] = RECOVERED
             else:
                 self._spread_infection(i, j, new_field)
@@ -155,14 +179,28 @@ class PestSimulation:
                 if self.field_state[ni, nj] == SUSCEPTIBLE and rng.geometric(p_transmission_geom)==1:
                     new_field[ni, nj] = LATENT
 
-    def run_simulation(self):
+    def simulate_open_loop(self):
         """
         Run the simulation and collect time-series data.
         """
         self.history = [self.field_state.copy()]
-        for _ in range(self.simulation_steps):
+        for _ in range(self.n_steps):
             self.field_state = self._update_field(self.field_state)
             self.history.append(self.field_state.copy())
+    
+    def simulate_closed_loop(self,ctrl_callback):
+        """
+        Rollout the simulation in closed-loop with the provided controller.
+
+        Args:
+            ctrl_callback: function mapping history to list of tuples indicating gridpoints to treat
+        """
+        if not self.history:
+            self.history = [self.field_state.copy()]
+        for i in range(self.n_steps):
+            if not (i % self.ctrl_interval):
+                action = ctrl_callback(self.history)
+                self.field_state = self._update_field(self.field_state, action)
 
     def plot_rollouts(self, time_points):
         """
